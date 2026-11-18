@@ -1,4 +1,5 @@
 from hotglue_models_accounting.accounting import PurchaseOrder
+from target_netsuite_v2.mapper.base_mapper import InvalidInputError
 from target_netsuite_v2.mapper.purchase_order_schema_mapper import PurchaseOrderSchemaMapper
 from target_netsuite_v2.sinks import NetSuiteBatchSink
 
@@ -86,18 +87,37 @@ class PurchaseOrderSink(NetSuiteBatchSink):
             purchase_order_ids
         )
 
+        vendor_contacts = {}
+        vendor_contact_error = None
+        if self.config.get("vendor_transaction_contact", False):
+            success, error, vendor_contacts = self.suite_talk_client.get_vendor_transaction_contacts(
+                {vendor["internalId"] for vendor in vendors}
+            )
+            if not success:
+                vendor_contact_error = error or "NetSuite vendor contact lookup failed"
+
         return {
             **self._target.reference_data,
             self.name: purchase_orders,
             "PurchaseOrderItems": purchase_order_items,
             "Vendors": vendors,
+            "VendorTransactionContacts": vendor_contacts,
+            "VendorTransactionContactError": vendor_contact_error,
             "Employees": employees,
             "Customers": customers,
             "Items": items
         }
 
     def preprocess_batch_record(self, record: dict, reference_data: dict) -> dict:
-        return PurchaseOrderSchemaMapper(record, self.name, reference_data).to_netsuite()
+        if reference_data.get("VendorTransactionContactError"):
+            raise InvalidInputError(reference_data["VendorTransactionContactError"])
+        payload = PurchaseOrderSchemaMapper(record, self.name, reference_data).to_netsuite()
+        if self.config.get("vendor_transaction_contact", False):
+            contact_id = reference_data["VendorTransactionContacts"].get(str(payload["entity"]["id"]))
+            payload.pop("custbody_transaction_contact", None)
+            if contact_id is not None:
+                payload["custbody_transaction_contact"] = {"id": contact_id}
+        return payload
 
     def upsert_record(self, record: dict, reference_data: dict):
         state = {}

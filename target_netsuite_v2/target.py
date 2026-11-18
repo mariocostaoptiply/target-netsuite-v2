@@ -4,8 +4,9 @@ import os
 from datetime import datetime
 from pathlib import PurePath
 from pendulum import parse
-from singer_sdk import typing as th
-from target_hotglue.target import TargetHotglue
+from hotglue_singer_sdk import typing as th
+from hotglue_singer_sdk.helpers.capabilities import AlertingLevel
+from hotglue_singer_sdk.target_sdk.target import TargetHotglue
 from target_netsuite_v2.sink.vendor_sink import VendorSink
 from target_netsuite_v2.sink.vendor_credit_sink import VendorCreditSink
 from target_netsuite_v2.sink.account_sink import AccountSink
@@ -24,12 +25,16 @@ class TargetNetsuiteV2(TargetHotglue):
     """netsuite-v2 target class."""
 
     name = "target-netsuite-v2"
+    alerting_level = AlertingLevel.WARNING
     config_jsonschema = th.PropertiesList(
         th.Property("ns_consumer_key", th.StringType),
         th.Property("ns_consumer_secret", th.StringType),
         th.Property("ns_token_key", th.StringType),
         th.Property("ns_token_secret", th.StringType),
-        th.Property("ns_account", th.StringType)
+        th.Property("ns_account", th.StringType),
+        th.Property("vendor_transaction_contact", th.BooleanType, default=False),
+        th.Property("export_target_custom_payload", th.ObjectType(), default={}),
+        th.Property("send_locationId", th.StringType),
     ).to_dict()
 
     SINK_TYPES = [
@@ -53,10 +58,29 @@ class TargetNetsuiteV2(TargetHotglue):
         validate_config: bool = True,
         state: str = None
     ) -> None:
-        self.config_file = config[0]
-        super().__init__(config, parse_env_config, validate_config)
+        super().__init__(config, parse_env_config, validate_config, state=state)
         self.suite_talk_client = self.get_ns_client()
         self.reference_data = self.get_reference_data()
+
+    def _validate_unified_schema(self, sink, transformed_record):
+        # Enrich before validation so reference lookups and replay hashes see configured values.
+        if sink.name == PurchaseOrderSink.name:
+            extra = self.config.get("export_target_custom_payload")
+            if extra:
+                record = {**transformed_record, **extra}
+                custom_fields = transformed_record.get("customFields") or []
+                if isinstance(custom_fields, list) and isinstance(extra.get("customFields"), list):
+                    record["customFields"] = custom_fields + extra["customFields"]
+                transformed_record = record
+            location_id = self.config.get("send_locationId")
+            lines = transformed_record.get("lineItems")
+            if location_id and isinstance(lines, list) and all(isinstance(line, dict) for line in lines):
+                lines = [{**line, "locationId": location_id} for line in lines]
+                # Clear names so an invalid configured ID cannot fall back to another location.
+                for line in lines:
+                    line.pop("locationName", None)
+                transformed_record = {**transformed_record, "lineItems": lines}
+        return super()._validate_unified_schema(sink, transformed_record)
 
     def get_ns_client(self):
         netsuite_config = {

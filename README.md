@@ -2,7 +2,9 @@
 
 `target-netsuite-v2` is a Singer target for netsuite-v2.
 
-Build with the [Meltano Target SDK](https://sdk.meltano.com).
+Built with `hotglue-singer-sdk==1.0.38`, matching the release locked by
+`Optiply/target-picqer`. Both CLI entry points (`target-netsuite-v2` and
+`target-netsuite`) and the real-time handler use this SDK.
 
 ## Installation
 
@@ -25,6 +27,16 @@ target is available by running:
 target-netsuite-v2 --about
 ```
 
+`vendor_transaction_contact` (default `false`): fetch PO contacts directly from
+NetSuite using the latest valid PO contact or sole active vendor contact.
+Replaces incoming `custbody_transaction_contact`; omits it if none is found.
+Lookup errors block PO writes and emit `success: false`.
+
+`export_target_custom_payload` (default `{}`): overlays PO fields before mapping.
+`customFields` are appended; config wins conflicts. Contact lookup still wins last.
+
+`send_locationId`: when non-empty, overrides every PO line location; header location is unchanged.
+
 ### Configure using environment variables
 
 This Singer target will automatically import any environment variables within the working directory's
@@ -38,6 +50,11 @@ environment variable is set either in the terminal context or in the `.env` file
 ## Usage
 
 You can easily run `target-netsuite-v2` by itself or in a pipeline using [Meltano](https://meltano.com/).
+
+Mapping failures emit `success: false`, error details and available identifiers in
+the record bookmark, and increment the stream summary's `fail` counter.
+
+PO employee mapping is optional; supplied employee references must resolve.
 
 ### Executing the Target Directly
 
@@ -59,13 +76,14 @@ pipx install poetry
 poetry install
 ```
 
-### Create and Run Tests
+### Run Offline Tests
 
-Create tests within the `target_netsuite_v2/tests` subfolder and
-  then run:
+The compatibility tests exercise all entity streams, purchase-order updates and
+failures, state restoration, and the real-time handler. HTTP is mocked; real-time
+processing runs in-process instead of spawning the CLI. No NetSuite account is used.
 
 ```bash
-poetry run pytest
+poetry run pytest target_netsuite_v2/tests/test_sdk_compatibility.py -q
 ```
 
 You can also test the `target-netsuite-v2` CLI interface directly using `poetry run`:
