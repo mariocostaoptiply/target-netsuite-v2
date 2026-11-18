@@ -3,10 +3,10 @@ import json
 import hashlib
 
 from datetime import datetime
-from singer_sdk.plugin_base import PluginBase
-from singer_sdk.sinks import BatchSink
-from target_hotglue.client import HotglueBaseSink
-from target_hotglue.common import HGJSONEncoder
+from hotglue_singer_sdk.plugin_base import PluginBase
+from hotglue_singer_sdk.sinks import BatchSink
+from hotglue_singer_sdk.target_sdk.client import HotglueBaseSink
+from hotglue_singer_sdk.target_sdk.common import HGJSONEncoder
 from typing import Dict, List, Optional
 from target_netsuite_v2.suite_talk_client import SuiteTalkRestClient
 from target_netsuite_v2.mapper.base_mapper import extract_addresses_from_record, InvalidInputError, InvalidDateError, DATE_REGEX
@@ -21,6 +21,14 @@ class NetSuiteBaseSink(HotglueBaseSink):
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
         self.suite_talk_client: SuiteTalkRestClient = self._target.suite_talk_client
+
+    @property
+    def base_url(self) -> str:
+        return self.suite_talk_client.record_url
+
+    @property
+    def endpoint(self) -> str:
+        return self.record_type
 
     def record_exists(self, record: dict) -> bool:
         return bool(record.get("internalId"))
@@ -86,7 +94,7 @@ class NetSuiteBatchSink(NetSuiteBaseSink, BatchSink):
         try:
             preprocessed = self.preprocess_batch_record(record, reference_data)
         except InvalidInputError as e:
-            state = {}
+            state = {"success": False}
             # TODO: Include error class in the message
             state["error"] = str(e)
             external_id = record.get("externalId")

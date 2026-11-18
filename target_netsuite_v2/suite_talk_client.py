@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from oauthlib import oauth1
 from requests_oauthlib import OAuth1
-from target_hotglue.common import HGJSONEncoder
+from hotglue_singer_sdk.target_sdk.common import HGJSONEncoder
 
 class SuiteTalkRestClient:
     ref_select_clauses = {
@@ -342,6 +342,79 @@ class SuiteTalkRestClient:
 
         return True, None, all_items
 
+    def get_vendor_transaction_contacts(self, vendor_ids):
+        vendor_ids = sorted({str(vendor_id) for vendor_id in vendor_ids})
+        if any(not vendor_id.isascii() or not vendor_id.isdigit() for vendor_id in vendor_ids):
+            return False, "Vendor contact lookup requires numeric NetSuite vendor IDs", {}
+
+        contacts = {}
+        for start in range(0, len(vendor_ids), 1000):
+            batch_ids = vendor_ids[start:start + 1000]
+            ids = ",".join(batch_ids)
+            # Match tap-netsuite-rest's vendor_transaction_contact selection rule.
+            query = f"""
+                SELECT v.id AS vendor_id,
+                       COALESCE(latest_contact.contact_id, sole_contact.contact_id) AS contact_id
+                FROM vendor v
+                LEFT JOIN (
+                    SELECT po.entity AS supplier_id,
+                           po.custbody_transaction_contact AS contact_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY po.entity
+                               ORDER BY po.createddate DESC, po.id DESC
+                           ) AS contact_rank
+                    FROM transaction po
+                    INNER JOIN CompanyContactRelationship relationship
+                        ON relationship.company = po.entity
+                       AND relationship.contact = po.custbody_transaction_contact
+                    INNER JOIN contact c
+                        ON c.id = relationship.contact AND c.isinactive = 'F'
+                    WHERE po.type = 'PurchOrd'
+                      AND po.entity IN ({ids})
+                      AND po.custbody_transaction_contact IS NOT NULL
+                ) latest_contact
+                    ON latest_contact.supplier_id = v.id
+                   AND latest_contact.contact_rank = 1
+                LEFT JOIN (
+                    SELECT relationship.company AS supplier_id,
+                           MIN(relationship.contact) AS contact_id
+                    FROM CompanyContactRelationship relationship
+                    INNER JOIN contact c
+                        ON c.id = relationship.contact AND c.isinactive = 'F'
+                    WHERE relationship.company IN ({ids})
+                    GROUP BY relationship.company
+                    HAVING COUNT(DISTINCT relationship.contact) = 1
+                ) sole_contact ON sole_contact.supplier_id = v.id
+                WHERE v.id IN ({ids})
+            """
+            try:
+                response = self._make_request(
+                    self.suiteql_url, "POST", data={"q": query},
+                    params={"limit": 1000}, headers={"Prefer": "transient"},
+                    timeout=(10, 60),
+                )
+                success, error = self._validate_response(response)
+                if not success:
+                    return False, error, {}
+                body = response.json()
+                if not isinstance(body, dict) or not isinstance(body.get("items"), list) or body.get("hasMore"):
+                    return False, "Incomplete or malformed NetSuite vendor contact response", {}
+                for item in body["items"]:
+                    vendor_id = str(item["vendor_id"])
+                    contact_id = item.get("contact_id")
+                    if vendor_id not in batch_ids or vendor_id in contacts:
+                        return False, "Unexpected or duplicate vendor in NetSuite contact response", {}
+                    if contact_id is not None:
+                        contact_id = str(contact_id)
+                        if not contact_id.isascii() or not contact_id.isdigit():
+                            return False, "Invalid NetSuite transaction contact ID", {}
+                    contacts[vendor_id] = contact_id
+                if any(vendor_id not in contacts for vendor_id in batch_ids):
+                    return False, "Missing vendor in NetSuite contact response", {}
+            except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as exc:
+                return False, f"Unable to read NetSuite vendor transaction contacts: {exc}", {}
+        return True, None, contacts
+
     def get_purchase_order_items(self, purchase_order_ids):
         if not purchase_order_ids:
             return True, None, {}
@@ -665,7 +738,7 @@ class SuiteTalkRestClient:
 
         return True, None, default_addresses
 
-    def _make_request(self, url, method, data=None, params=None, headers=None):
+    def _make_request(self, url, method, data=None, params=None, headers=None, timeout=None):
         request_headers = {"Content-Type": "application/json"}
         if headers:
             request_headers.update(headers)
@@ -692,7 +765,8 @@ class SuiteTalkRestClient:
             headers=request_headers,
             data=json_data,
             verify=True,
-            auth=oauth
+            auth=oauth,
+            timeout=timeout,
         )
 
         if res.status_code >= 400:

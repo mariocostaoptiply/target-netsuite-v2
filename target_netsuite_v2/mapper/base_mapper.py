@@ -259,8 +259,12 @@ class BaseMapper:
         if found:
             return found
 
-        # Raise an `InvalidReferenceError` if either the id or the name was provided for a reference field, but it was not found
-        if direct_id or ref_name or external_id_field or entity_id_field or item_id_field or tran_id_field:
+        # Missing matches are errors only when a reference value was supplied.
+        if any(
+            self.record.get(field)
+            for field in (id_field, name_field, external_id_field, entity_id_field, item_id_field, tran_id_field, number_field)
+            if field
+        ):
             lookup_attempts = []
             if direct_id:
                 lookup_attempts.append(f"by id {direct_id}")
