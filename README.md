@@ -55,6 +55,8 @@ Mapping failures emit `success: false`, error details and available identifiers 
 the record bookmark, and increment the stream summary's `fail` counter.
 
 PO employee mapping is optional; supplied employee references must resolve.
+PO weekend `dueDate` values move to Monday, preserving time and timezone.
+Missing dates and `issueDate` stay unchanged.
 
 ### Executing the Target Directly
 

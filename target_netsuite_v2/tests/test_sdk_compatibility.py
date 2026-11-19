@@ -7,6 +7,7 @@ import signal
 import sqlite3
 from contextlib import redirect_stdout
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,69 @@ def test_existing_purchase_order_is_patched(target, transport, capsys):
     assert state["bookmarks"]["PurchaseOrders"][-1]["id"] == "100"
 
 
+@pytest.mark.parametrize("existing", [False, True], ids=["create", "update"])
+@pytest.mark.parametrize("due_date,expected", [
+    ("2026-11-20T10:15:30Z", "2026-11-20T10:15:30+00:00"),
+    ("2026-11-21T10:15:30.123456Z", "2026-11-23T10:15:30.123456+00:00"),
+    ("2026-11-22T23:45:00-10:00", "2026-11-23T23:45:00-10:00"),
+    ("2026-11-23T00:15:00+14:00", "2026-11-23T00:15:00+14:00"),
+    ("2023-12-31", "2024-01-01T00:00:00"),
+    ("2020-02-29T08:30:00-07:00", "2020-03-02T08:30:00-07:00"),
+    ("2026-11-21T10:15:00", "2026-11-23T10:15:00"),
+    ("2026-11-21T00:30:00+05:30", "2026-11-23T00:30:00+05:30"),
+])
+def test_purchase_order_due_date_moves_only_weekends(target, transport, capsys, existing, due_date, expected):
+    if existing:
+        transport["transactions"]["PurchOrd"] = [{"internalId": "100", "externalId": "synthetic-date", "subsidiaryId": "1"}]
+    record = {
+        "externalId": "synthetic-date", "vendorId": "20", "lineItems": [PO_LINE],
+        "dueDate": due_date, "issueDate": "2026-11-21T07:30:00Z",
+    }
+    state = ingest(target, "PurchaseOrders", record, capsys)
+
+    method, _, payload = transport["writes"][0]
+    assert method == ("PATCH" if existing else "POST")
+    assert datetime.fromisoformat(payload["dueDate"].replace("Z", "+00:00")).isoformat() == expected
+    assert datetime.fromisoformat(payload["tranDate"].replace("Z", "+00:00")).isoformat() == "2026-11-21T07:30:00+00:00"
+    assert state["bookmarks"]["PurchaseOrders"][-1]["success"] is True
+
+
+@pytest.mark.parametrize("fields", [{}, {"dueDate": None}], ids=["missing", "null"])
+def test_purchase_order_without_due_date_does_not_add_one(target, transport, capsys, fields):
+    record = {"externalId": "synthetic-no-date", "vendorId": "20", "lineItems": [PO_LINE], **fields}
+    state = ingest(target, "PurchaseOrders", record, capsys)
+
+    assert "dueDate" not in transport["writes"][0][2]
+    assert state["bookmarks"]["PurchaseOrders"][-1]["success"] is True
+
+
+@pytest.mark.parametrize("due_date", ["not-a-date", "2026-02-30T10:00:00Z"])
+def test_invalid_purchase_order_due_date_fails_without_writing(target, transport, capsys, due_date):
+    record = {"externalId": "synthetic-invalid-date", "vendorId": "20", "lineItems": [PO_LINE], "dueDate": due_date}
+    with pytest.raises(ValueError):
+        ingest(target, "PurchaseOrders", record, capsys)
+
+    assert not transport["writes"]
+
+
+@pytest.mark.parametrize("stream,party", [("Bills", {"vendorId": "20"}), ("Invoices", {"customerId": "30"})])
+def test_other_transactions_keep_weekend_due_dates(target, transport, capsys, stream, party):
+    record = {"externalId": "synthetic-other-date", "lineItems": [LINE], "dueDate": "2026-11-21T10:00:00Z", **party}
+    state = ingest(target, stream, record, capsys)
+
+    assert datetime.fromisoformat(transport["writes"][0][2]["dueDate"].replace("Z", "+00:00")).isoformat() == "2026-11-21T10:00:00+00:00"
+    assert state["bookmarks"][stream][-1]["success"] is True
+
+
+@pytest.mark.parametrize("target_config", [{"export_target_custom_payload": {"dueDate": "2026-11-22T14:15:16+02:00"}}], indirect=True)
+def test_configured_purchase_order_due_date_also_moves_off_weekend(target, transport, capsys):
+    record = {"externalId": "synthetic-config-date", "vendorId": "20", "lineItems": [PO_LINE], "dueDate": "2026-11-20T10:00:00Z"}
+    state = ingest(target, "PurchaseOrders", record, capsys)
+
+    assert datetime.fromisoformat(transport["writes"][0][2]["dueDate"].replace("Z", "+00:00")).isoformat() == "2026-11-23T14:15:16+02:00"
+    assert state["bookmarks"]["PurchaseOrders"][-1]["success"] is True
+
+
 def test_rejected_purchase_order_is_reported_as_failed(target, transport, capsys):
     transport["status"] = 400
     state = ingest(target, "PurchaseOrders", {"externalId": "synthetic-rejected", "vendorId": "20", "lineItems": [PO_LINE]}, capsys)
@@ -285,13 +349,14 @@ def test_real_time_purchase_order_returns_delivery_state(target, transport, monk
 
     monkeypatch.setattr(sdk_lambda.RealTime, "run", run_offline)
     schema = {"type": "SCHEMA", "stream": "PurchaseOrders", "schema": target.get_sink_class("PurchaseOrders").unified_schema.model_json_schema(), "key_properties": []}
-    record = {"type": "RECORD", "stream": "PurchaseOrders", "record": {"externalId": "synthetic-realtime", "vendorId": "20", "lineItems": [PO_LINE]}}
+    record = {"type": "RECORD", "stream": "PurchaseOrders", "record": {"externalId": "synthetic-realtime", "vendorId": "20", "dueDate": "2026-11-21T10:00:00Z", "lineItems": [PO_LINE]}}
     try:
         result = handler(dict(target.config), "PurchaseOrders", json.dumps(schema), json.dumps(record), logging.getLogger("test"))
         bookmark = result["state"]["bookmarks"]["PurchaseOrders"][-1]
         assert bookmark["id"] == "900"
         assert bookmark["success"] is True
         assert transport["writes"][0][1].endswith("/purchaseOrder")
+        assert datetime.fromisoformat(transport["writes"][0][2]["dueDate"].replace("Z", "+00:00")).isoformat() == "2026-11-23T10:00:00+00:00"
         if target_config:
             assert transport["writes"][0][2]["approvalStatus"] == {"id": "1"}
             assert transport["writes"][0][2]["department"] == {"id": "70"}
