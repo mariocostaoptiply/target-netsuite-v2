@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from target_netsuite_v2.mapper.base_mapper import BaseMapper
 from target_netsuite_v2.mapper.purchase_order_line_item_schema_mapper import PurchaseOrderLineItemSchemaMapper
 
@@ -43,6 +45,10 @@ class PurchaseOrderSchemaMapper(BaseMapper):
             payload["employee"] = employee
 
         self._map_fields(payload)
+
+        due_date = self.record.get("dueDate")
+        if due_date is not None and due_date.weekday() >= 5:
+            payload["dueDate"] = due_date + timedelta(days=7 - due_date.weekday())
 
         return payload
 
